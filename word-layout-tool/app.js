@@ -209,7 +209,10 @@
 
       if (refs.length === 0) {
         const text = p.textContent.trim();
-        if (text) blocks.push({ type: 'text', content: text });
+        if (text) {
+          const level = detectHeadingLevel(p, text);
+          blocks.push({ type: 'text', content: text, level });
+        }
         continue;
       }
 
@@ -333,6 +336,37 @@
     }
 
     return refs;
+  }
+
+  // 判断段落级别：返回 0 表示一级标题，1 二级，… -1 普通正文
+  // 综合三种策略：w:outlineLvl > w:pStyle > 文本兜底
+  function detectHeadingLevel(p, text) {
+    const pPr = p.getElementsByTagNameNS(NS.W, 'pPr')[0];
+    if (pPr) {
+      // 策略 1：大纲级别（最权威）
+      const outlines = pPr.getElementsByTagNameNS(NS.W, 'outlineLvl');
+      if (outlines.length > 0) {
+        const v = parseInt(outlines[0].getAttributeNS(NS.W, 'val'), 10);
+        if (!isNaN(v) && v >= 0 && v <= 8) return v;
+      }
+      // 策略 2：样式名
+      const styles = pPr.getElementsByTagNameNS(NS.W, 'pStyle');
+      if (styles.length > 0) {
+        const sv = (styles[0].getAttributeNS(NS.W, 'val') || '').toLowerCase();
+        // 英文 Word：Heading1 / heading 1；中文 WPS：标题 1；模板可能直接是数字
+        const m = sv.match(/heading\s*([1-9])/) || sv.match(/^([1-9])$/);
+        if (m) return parseInt(m[1], 10) - 1;
+        if (sv === '标题1' || sv === '标题 1') return 0;
+        if (sv === '标题2' || sv === '标题 2') return 1;
+        if (sv === '标题3' || sv === '标题 3') return 2;
+      }
+    }
+    // 策略 3：文本兜底（仅识别一级章节，避免误报）
+    if (/^第\s*[一二三四五六七八九十百零〇\d]+\s*章[\s　]/.test(text)
+        || /^Chapter\s+\d+/i.test(text)) {
+      return 0;
+    }
+    return -1;
   }
 
   function imageMime(ext) {
@@ -569,12 +603,15 @@
     // （之前按"1 字 1 格"估算英文文献会高估 2~3 倍，导致整页内容被错挤到下一页）
     const measureDiv = ensureMeasureDiv(cfg);
     const heightCache = new Map();
-    function textHeight(text) {
-      if (heightCache.has(text)) return heightCache.get(text);
+    function textHeight(text, level = -1) {
+      const key = level + '|' + text;
+      if (heightCache.has(key)) return heightCache.get(key);
+      applyMeasureStyle(measureDiv, cfg, level);
       measureDiv.textContent = text;
-      // px → pt
-      const h = measureDiv.offsetHeight * (72 / 96) + 2;
-      heightCache.set(text, h);
+      // px → pt，标题段落额外加 12pt 段后空间
+      const extra = level === 0 ? 18 : (level >= 1 ? 10 : 2);
+      const h = measureDiv.offsetHeight * (72 / 96) + extra;
+      heightCache.set(key, h);
       return h;
     }
 
@@ -591,7 +628,11 @@
     for (let bi = 0; bi < blocks.length; bi++) {
       const b = blocks[bi];
       if (b.type === 'text') {
-        const h = textHeight(b.content);
+        // 一级标题强制开新页（若当前页已有内容）
+        if (b.level === 0 && cur.blocks.length > 0) {
+          pushPage();
+        }
+        const h = textHeight(b.content, b.level);
         if (cur.usedH + h > cfg.contentHpt) {
           pushPage();
         }
@@ -669,10 +710,26 @@
       `;
       document.body.appendChild(_measureDiv);
     }
-    _measureDiv.style.width = mmToPx(cfg.contentWmm) + 'px';
-    _measureDiv.style.fontSize = cfg.fontSize + 'pt';
-    _measureDiv.style.lineHeight = String(cfg.lineSpacing);
+    applyMeasureStyle(_measureDiv, cfg, -1);
     return _measureDiv;
+  }
+
+  // 根据标题级别应用对应字号/粗细/对齐到测量 div
+  function applyMeasureStyle(div, cfg, level) {
+    div.style.width = mmToPx(cfg.contentWmm) + 'px';
+    const headingScale = { 0: 1.8, 1: 1.4, 2: 1.2 };
+    if (level >= 0 && headingScale[level]) {
+      div.style.fontSize = (cfg.fontSize * headingScale[level]) + 'pt';
+      div.style.fontWeight = '700';
+      div.style.textAlign = 'center';
+      div.style.textIndent = '0';
+    } else {
+      div.style.fontSize = cfg.fontSize + 'pt';
+      div.style.fontWeight = '400';
+      div.style.textAlign = 'justify';
+      div.style.textIndent = '2em';
+    }
+    div.style.lineHeight = String(cfg.lineSpacing);
   }
 
   // 尝试通过放大本页末尾图片填补页尾留白
@@ -792,6 +849,13 @@
         if (b.type === 'text') {
           const p = document.createElement('p');
           p.className = 'text-block';
+          if (b.level === 0) {
+            p.classList.add('heading-1');
+          } else if (b.level === 1) {
+            p.classList.add('heading-2');
+          } else if (b.level === 2) {
+            p.classList.add('heading-3');
+          }
           p.textContent = b.content;
           content.appendChild(p);
         } else {
@@ -997,7 +1061,7 @@
     let drawingDocId = 1;
     state.blocks.forEach(b => {
       if (b.type === 'text') {
-        body.push(makeTextParagraph(b.content));
+        body.push(makeTextParagraph(b.content, b.level));
       } else {
         const im = state.images[b.idx];
         const widthEMU = Math.round(im.displayW / 72 * EMU_PER_INCH);
@@ -1044,7 +1108,17 @@
     }[c]));
   }
 
-  function makeTextParagraph(text) {
+  function makeTextParagraph(text, level) {
+    if (level === 0) {
+      // 一级标题：分页符 + 居中 + 加粗 + 大字号 + outlineLvl
+      return `<w:p><w:pPr><w:pageBreakBefore/><w:outlineLvl w:val="0"/><w:jc w:val="center"/><w:spacing w:before="240" w:after="240"/></w:pPr><w:r><w:rPr><w:b/><w:sz w:val="36"/></w:rPr><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`;
+    }
+    if (level === 1) {
+      return `<w:p><w:pPr><w:outlineLvl w:val="1"/><w:spacing w:before="200" w:after="160"/></w:pPr><w:r><w:rPr><w:b/><w:sz w:val="28"/></w:rPr><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`;
+    }
+    if (level === 2) {
+      return `<w:p><w:pPr><w:outlineLvl w:val="2"/><w:spacing w:before="160" w:after="120"/></w:pPr><w:r><w:rPr><w:b/><w:sz w:val="24"/></w:rPr><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`;
+    }
     return `<w:p><w:pPr><w:ind w:firstLineChars="200"/></w:pPr><w:r><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`;
   }
 
