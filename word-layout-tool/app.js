@@ -105,42 +105,217 @@
   }
 
   // ===== docx 解析 =====
+  // 直接解开 docx 压缩包并读 OOXML，覆盖以下图片类型：
+  // - 嵌入式 (wp:inline + a:blip)
+  // - 浮动式 (wp:anchor + a:blip，含文字环绕)
+  // - VML 旧版 (v:imagedata)
+  // - 表格单元格内的图片
+  // - 页眉/页脚里的图片（仅提示，不参与主流排版）
+  // - 矢量格式 EMF/WMF（用占位图预览，导出时保留原始字节）
+  const NS = {
+    W: 'http://schemas.openxmlformats.org/wordprocessingml/2006/main',
+    A: 'http://schemas.openxmlformats.org/drawingml/2006/main',
+    R: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+    WP: 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing',
+    V: 'urn:schemas-microsoft-com:vml',
+  };
+
   async function parseDocx(file) {
     state.sourceFileName = file.name;
     state.originalDocxBlob = file;
     log(`正在解析 ${file.name}…`);
-    const arrayBuffer = await file.arrayBuffer();
 
-    // 用 mammoth 解析得到带原始尺寸信息的 HTML
-    const result = await mammoth.convertToHtml(
-      { arrayBuffer },
-      {
-        convertImage: mammoth.images.imgElement(async (image) => {
-          const buf = await image.read('base64');
-          const ext = (image.contentType || 'image/png').split('/')[1];
-          // 获取原始尺寸：通过解码图像
-          const dataUrl = `data:${image.contentType};base64,${buf}`;
-          const { naturalWidth, naturalHeight } = await measureImage(dataUrl);
-          return {
-            src: dataUrl,
-            'data-nw': naturalWidth,
-            'data-nh': naturalHeight,
-            'data-ctype': image.contentType,
-          };
-        })
+    const zip = await JSZip.loadAsync(file);
+
+    // 1) 读关系文件
+    const relsFile = zip.file('word/_rels/document.xml.rels');
+    if (!relsFile) throw new Error('文档结构异常：缺少 word/_rels/document.xml.rels');
+    const rels = parseRels(await relsFile.async('text'));
+
+    // 2) 读 document.xml
+    const docFile = zip.file('word/document.xml');
+    if (!docFile) throw new Error('文档结构异常：缺少 word/document.xml');
+    const doc = parseXml(await docFile.async('text'));
+
+    // 3) 按文档顺序收集 w:p（含表格内的段落）
+    const paragraphs = Array.from(doc.getElementsByTagNameNS(NS.W, 'p'));
+
+    const blocks = [];
+    let imgIndex = 0;
+    const stats = { inline: 0, float: 0, vml: 0, vector: 0, skipped: 0 };
+    const consumedAsCaption = new Set();
+
+    for (let pi = 0; pi < paragraphs.length; pi++) {
+      if (consumedAsCaption.has(pi)) continue;
+      const p = paragraphs[pi];
+      const refs = extractImageRefs(p);
+
+      if (refs.length === 0) {
+        const text = p.textContent.trim();
+        if (text) blocks.push({ type: 'text', content: text });
+        continue;
       }
-    );
-    if (result.messages && result.messages.length) {
-      result.messages.forEach(m => log(`mammoth: ${m.type} - ${m.message}`, 'warn'));
+
+      // 同一段可能含多张图，仅当只有 1 张时才尝试吞掉下一段作为图注
+      let captionText = '';
+      if (refs.length === 1 && paragraphs[pi + 1]) {
+        const nxt = paragraphs[pi + 1];
+        const nxtText = nxt.textContent.trim();
+        if (nxtText && isLikelyCaption(nxtText) && extractImageRefs(nxt).length === 0) {
+          captionText = nxtText;
+          consumedAsCaption.add(pi + 1);
+        }
+      }
+
+      for (const ref of refs) {
+        const target = rels[ref.rid];
+        if (!target) {
+          log(`图片关系 ${ref.rid} 缺失，跳过`, 'warn');
+          stats.skipped++;
+          continue;
+        }
+        // target 例如 "media/image1.png"，也可能是绝对路径
+        const path = target.startsWith('/') ? target.slice(1)
+                    : target.startsWith('word/') ? target
+                    : 'word/' + target;
+        const fileEntry = zip.file(path);
+        if (!fileEntry) {
+          log(`图片文件 ${path} 不存在，跳过`, 'warn');
+          stats.skipped++;
+          continue;
+        }
+
+        const ext = (path.split('.').pop() || 'png').toLowerCase();
+        const ctype = imageMime(ext);
+        const base64 = await fileEntry.async('base64');
+        const isVector = ext === 'emf' || ext === 'wmf';
+
+        let dataUrl, nw, nh;
+        if (isVector) {
+          // 浏览器无法渲染 EMF/WMF：用占位图预览，但保留原始字节
+          dataUrl = makeVectorPlaceholder(ext);
+          nw = ref.cxEmu ? ref.cxEmu / EMU_PER_INCH * 96 : 800;
+          nh = ref.cyEmu ? ref.cyEmu / EMU_PER_INCH * 96 : 600;
+          stats.vector++;
+        } else {
+          dataUrl = `data:${ctype};base64,${base64}`;
+          const dim = await measureImage(dataUrl);
+          nw = dim.naturalWidth; nh = dim.naturalHeight;
+        }
+
+        if (ref.type === 'float') stats.float++;
+        else if (ref.type === 'vml') stats.vml++;
+        else stats.inline++;
+
+        blocks.push({
+          type: 'image',
+          idx: imgIndex++,
+          src: dataUrl,
+          originalBase64: base64,    // 导出时优先使用原始字节
+          originalExt: ext,
+          naturalW: nw,
+          naturalH: nh,
+          contentType: ctype,
+          caption: captionText,
+          displayW: 0,
+          displayH: 0,
+          groupId: -1,
+          imageType: ref.type,        // inline / float / vml
+          // 仅第一张图带 caption；其余清空
+          ...((captionText && imgIndex > 1) ? { caption: '' } : {}),
+        });
+        captionText = ''; // 同段多图只把图注挂到第一张
+      }
     }
-    const html = result.value;
-    const blocks = extractBlocks(html);
+
     state.blocks = blocks;
     state.images = blocks.filter(b => b.type === 'image');
-    log(`提取完成：${blocks.length} 个段落块，其中 ${state.images.length} 张图片。`, 'ok');
-    if (state.images.length === 0) {
-      log('未找到嵌入式图片，请检查文档是否使用浮动图片。', 'warn');
+
+    const total = state.images.length;
+    log(`提取完成：${blocks.length} 段，图片 ${total} 张（嵌入式 ${stats.inline} · 浮动 ${stats.float} · VML ${stats.vml}）`, 'ok');
+    if (stats.float > 0) log(`已把 ${stats.float} 张浮动图片按嵌入式重新参与排版`, 'warn');
+    if (stats.vml > 0) log(`检测到 ${stats.vml} 张 VML 旧版图片，已正常解析`, 'warn');
+    if (stats.vector > 0) log(`${stats.vector} 张矢量图 (EMF/WMF) 浏览器无法预览，但导出会保留原始字节`, 'warn');
+    if (stats.skipped > 0) log(`${stats.skipped} 张图片关系/文件缺失，已跳过`, 'warn');
+    if (total === 0) log('未在文档中找到任何图片', 'warn');
+  }
+
+  function parseXml(text) {
+    const doc = new DOMParser().parseFromString(text, 'application/xml');
+    const err = doc.querySelector('parsererror');
+    if (err) throw new Error('XML 解析失败：' + err.textContent.slice(0, 120));
+    return doc;
+  }
+
+  function parseRels(xmlText) {
+    const doc = parseXml(xmlText);
+    const map = {};
+    Array.from(doc.getElementsByTagName('Relationship')).forEach(r => {
+      map[r.getAttribute('Id')] = r.getAttribute('Target');
+    });
+    return map;
+  }
+
+  // 从一个 <w:p> 中提取所有图片引用（inline / float / VML）
+  function extractImageRefs(p) {
+    const refs = [];
+
+    // 1) DrawingML 图片 —— a:blip[r:embed]
+    const blips = Array.from(p.getElementsByTagNameNS(NS.A, 'blip'));
+    for (const blip of blips) {
+      const rid = blip.getAttributeNS(NS.R, 'embed') || blip.getAttributeNS(NS.R, 'link');
+      if (!rid) continue;
+
+      // 判断是 inline 还是 anchor，并提取 wp:extent
+      let type = 'inline';
+      let cxEmu = 0, cyEmu = 0;
+      let cur = blip.parentNode;
+      while (cur && cur.nodeType === 1) {
+        if (cur.namespaceURI === NS.WP) {
+          if (cur.localName === 'anchor') type = 'float';
+          else if (cur.localName === 'inline') type = 'inline';
+          const exts = cur.getElementsByTagNameNS(NS.WP, 'extent');
+          if (exts.length > 0) {
+            cxEmu = parseInt(exts[0].getAttribute('cx'), 10) || 0;
+            cyEmu = parseInt(exts[0].getAttribute('cy'), 10) || 0;
+          }
+          break;
+        }
+        cur = cur.parentNode;
+      }
+      refs.push({ rid, type, cxEmu, cyEmu });
     }
+
+    // 2) VML 旧版图片 —— v:imagedata[r:id]
+    const vmls = Array.from(p.getElementsByTagNameNS(NS.V, 'imagedata'));
+    for (const v of vmls) {
+      const rid = v.getAttributeNS(NS.R, 'id');
+      if (rid) refs.push({ rid, type: 'vml', cxEmu: 0, cyEmu: 0 });
+    }
+
+    return refs;
+  }
+
+  function imageMime(ext) {
+    const map = {
+      png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+      gif: 'image/gif', bmp: 'image/bmp', tif: 'image/tiff', tiff: 'image/tiff',
+      svg: 'image/svg+xml', webp: 'image/webp',
+      emf: 'image/x-emf', wmf: 'image/x-wmf',
+    };
+    return map[ext] || 'application/octet-stream';
+  }
+
+  function makeVectorPlaceholder(ext) {
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="800" height="500" viewBox="0 0 800 500">
+      <rect width="800" height="500" fill="#eef0f4" stroke="#c8ccd4" stroke-width="2" stroke-dasharray="8 6"/>
+      <g transform="translate(400 230)" text-anchor="middle" font-family="sans-serif" fill="#6b7280">
+        <text font-size="56" font-weight="700">${ext.toUpperCase()}</text>
+        <text y="60" font-size="22">矢量图 · 浏览器无法预览</text>
+        <text y="92" font-size="16" fill="#9ca3af">导出时保留原始字节</text>
+      </g>
+    </svg>`;
+    return 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(svg)));
   }
 
   function measureImage(dataUrl) {
@@ -150,51 +325,6 @@
       img.onerror = () => resolve({ naturalWidth: 800, naturalHeight: 600 });
       img.src = dataUrl;
     });
-  }
-
-  // 解析 mammoth 输出的 HTML，转化为块序列
-  function extractBlocks(html) {
-    const wrapper = document.createElement('div');
-    wrapper.innerHTML = html;
-
-    const blocks = [];
-    let imgIndex = 0;
-    const paragraphs = Array.from(wrapper.children);
-
-    for (let i = 0; i < paragraphs.length; i++) {
-      const p = paragraphs[i];
-      const img = p.querySelector('img');
-      if (img) {
-        const nw = parseFloat(img.getAttribute('data-nw')) || 800;
-        const nh = parseFloat(img.getAttribute('data-nh')) || 600;
-        const ctype = img.getAttribute('data-ctype') || 'image/png';
-        // 尝试在下一段找图注
-        let captionText = '';
-        const next = paragraphs[i + 1];
-        if (next && !next.querySelector('img') && isLikelyCaption(next.textContent)) {
-          captionText = next.textContent.trim();
-          i++; // 吞掉图注段
-        }
-        blocks.push({
-          type: 'image',
-          idx: imgIndex++,
-          src: img.src,
-          naturalW: nw,
-          naturalH: nh,
-          contentType: ctype,
-          caption: captionText,
-          displayW: 0,
-          displayH: 0,
-          groupId: -1,
-        });
-      } else {
-        const text = p.textContent.trim();
-        if (text) {
-          blocks.push({ type: 'text', content: text });
-        }
-      }
-    }
-    return blocks;
   }
 
   function isLikelyCaption(text) {
@@ -734,6 +864,13 @@
   <Default Extension="jpg" ContentType="image/jpeg"/>
   <Default Extension="jpeg" ContentType="image/jpeg"/>
   <Default Extension="gif" ContentType="image/gif"/>
+  <Default Extension="bmp" ContentType="image/bmp"/>
+  <Default Extension="tif" ContentType="image/tiff"/>
+  <Default Extension="tiff" ContentType="image/tiff"/>
+  <Default Extension="svg" ContentType="image/svg+xml"/>
+  <Default Extension="webp" ContentType="image/webp"/>
+  <Default Extension="emf" ContentType="image/x-emf"/>
+  <Default Extension="wmf" ContentType="image/x-wmf"/>
   <Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
   <Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>
 </Types>`;
@@ -764,9 +901,10 @@
 
     for (let i = 0; i < state.images.length; i++) {
       const im = state.images[i];
-      const ext = (im.contentType || 'image/png').split('/')[1] || 'png';
+      // 优先用原始字节 + 原始扩展名（保护 EMF/WMF/TIFF 等浏览器不能渲染但 Word 能用的格式）
+      const ext = im.originalExt || ((im.contentType || 'image/png').split('/')[1] || 'png');
       const filename = `image${i + 1}.${ext}`;
-      const base64 = im.src.split(',')[1];
+      const base64 = im.originalBase64 || im.src.split(',')[1];
       mediaFolder.file(filename, base64, { base64: true });
       const rid = `rId${100 + i}`;
       imageRels.push({ rid, target: `media/${filename}` });
