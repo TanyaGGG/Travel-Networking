@@ -123,22 +123,72 @@
   async function parseDocx(file) {
     state.sourceFileName = file.name;
     state.originalDocxBlob = file;
-    log(`正在解析 ${file.name}…`);
+    log(`正在解析 ${file.name} (${(file.size / 1024).toFixed(1)} KB)…`);
 
-    const zip = await JSZip.loadAsync(file);
+    // 步骤 1：解压 zip
+    let zip;
+    try {
+      zip = await JSZip.loadAsync(file);
+    } catch (e) {
+      throw new Error(`解压 docx 失败（文件可能损坏）：${e.message}`);
+    }
 
-    // 1) 读关系文件
+    // 步骤 2：读关系文件
     const relsFile = zip.file('word/_rels/document.xml.rels');
     if (!relsFile) throw new Error('文档结构异常：缺少 word/_rels/document.xml.rels');
-    const rels = parseRels(await relsFile.async('text'));
+    let rels;
+    try {
+      rels = parseRels(await relsFile.async('text'));
+    } catch (e) {
+      throw new Error(`解析关系文件失败：${e.message}`);
+    }
 
-    // 2) 读 document.xml
+    // 步骤 3：读 document.xml
     const docFile = zip.file('word/document.xml');
     if (!docFile) throw new Error('文档结构异常：缺少 word/document.xml');
-    const doc = parseXml(await docFile.async('text'));
+    const docXmlText = await docFile.async('text');
+    let doc;
+    try {
+      doc = parseXml(docXmlText);
+    } catch (e) {
+      throw new Error(`document.xml 解析失败：${e.message}`);
+    }
 
-    // 3) 按文档顺序收集 w:p（含表格内的段落）
+    // 步骤 4：收集所有 w:p（含表格内）
     const paragraphs = Array.from(doc.getElementsByTagNameNS(NS.W, 'p'));
+    log(`共 ${paragraphs.length} 个段落，开始抽取图片…`);
+
+    // 步骤 5：缓存 - 同一 rId 仅加载/测量一次
+    const imageCache = new Map(); // rId -> { dataUrl, base64, nw, nh, ctype, ext, isVector }
+    async function loadImageByRid(rid, ref) {
+      if (imageCache.has(rid)) return imageCache.get(rid);
+      const target = rels[rid];
+      if (!target) return null;
+      const path = target.startsWith('/') ? target.slice(1)
+                  : target.startsWith('word/') ? target
+                  : 'word/' + target;
+      const fileEntry = zip.file(path);
+      if (!fileEntry) return null;
+
+      const ext = (path.split('.').pop() || 'png').toLowerCase();
+      const ctype = imageMime(ext);
+      const base64 = await fileEntry.async('base64');
+      const isVector = ext === 'emf' || ext === 'wmf';
+
+      let dataUrl, nw, nh;
+      if (isVector) {
+        dataUrl = makeVectorPlaceholder(ext);
+        nw = ref.cxEmu ? ref.cxEmu / EMU_PER_INCH * 96 : 800;
+        nh = ref.cyEmu ? ref.cyEmu / EMU_PER_INCH * 96 : 600;
+      } else {
+        dataUrl = `data:${ctype};base64,${base64}`;
+        const dim = await measureImage(dataUrl);
+        nw = dim.naturalWidth; nh = dim.naturalHeight;
+      }
+      const entry = { dataUrl, base64, nw, nh, ctype, ext, isVector };
+      imageCache.set(rid, entry);
+      return entry;
+    }
 
     const blocks = [];
     let imgIndex = 0;
@@ -148,7 +198,14 @@
     for (let pi = 0; pi < paragraphs.length; pi++) {
       if (consumedAsCaption.has(pi)) continue;
       const p = paragraphs[pi];
-      const refs = extractImageRefs(p);
+
+      let refs;
+      try {
+        refs = extractImageRefs(p);
+      } catch (e) {
+        log(`段落 ${pi} 抽取图片引用失败：${e.message}`, 'warn');
+        refs = [];
+      }
 
       if (refs.length === 0) {
         const text = p.textContent.trim();
@@ -156,9 +213,9 @@
         continue;
       }
 
-      // 同一段可能含多张图，仅当只有 1 张时才尝试吞掉下一段作为图注
+      // 同一段含多张图时，下段图注只挂给第一张
       let captionText = '';
-      if (refs.length === 1 && paragraphs[pi + 1]) {
+      if (refs.length >= 1 && paragraphs[pi + 1]) {
         const nxt = paragraphs[pi + 1];
         const nxtText = nxt.textContent.trim();
         if (nxtText && isLikelyCaption(nxtText) && extractImageRefs(nxt).length === 0) {
@@ -167,64 +224,41 @@
         }
       }
 
+      let firstInThisPara = true;
       for (const ref of refs) {
-        const target = rels[ref.rid];
-        if (!target) {
-          log(`图片关系 ${ref.rid} 缺失，跳过`, 'warn');
+        try {
+          const entry = await loadImageByRid(ref.rid, ref);
+          if (!entry) {
+            log(`图片 ${ref.rid} 文件/关系缺失，跳过`, 'warn');
+            stats.skipped++;
+            continue;
+          }
+
+          if (ref.type === 'float') stats.float++;
+          else if (ref.type === 'vml') stats.vml++;
+          else stats.inline++;
+          if (entry.isVector) stats.vector++;
+
+          blocks.push({
+            type: 'image',
+            idx: imgIndex++,
+            src: entry.dataUrl,
+            originalBase64: entry.base64,
+            originalExt: entry.ext,
+            naturalW: entry.nw,
+            naturalH: entry.nh,
+            contentType: entry.ctype,
+            caption: firstInThisPara ? captionText : '',
+            displayW: 0,
+            displayH: 0,
+            groupId: -1,
+            imageType: ref.type,
+          });
+          firstInThisPara = false;
+        } catch (e) {
+          log(`段落 ${pi} 处理图片 ${ref.rid} 出错：${e.message}`, 'error');
           stats.skipped++;
-          continue;
         }
-        // target 例如 "media/image1.png"，也可能是绝对路径
-        const path = target.startsWith('/') ? target.slice(1)
-                    : target.startsWith('word/') ? target
-                    : 'word/' + target;
-        const fileEntry = zip.file(path);
-        if (!fileEntry) {
-          log(`图片文件 ${path} 不存在，跳过`, 'warn');
-          stats.skipped++;
-          continue;
-        }
-
-        const ext = (path.split('.').pop() || 'png').toLowerCase();
-        const ctype = imageMime(ext);
-        const base64 = await fileEntry.async('base64');
-        const isVector = ext === 'emf' || ext === 'wmf';
-
-        let dataUrl, nw, nh;
-        if (isVector) {
-          // 浏览器无法渲染 EMF/WMF：用占位图预览，但保留原始字节
-          dataUrl = makeVectorPlaceholder(ext);
-          nw = ref.cxEmu ? ref.cxEmu / EMU_PER_INCH * 96 : 800;
-          nh = ref.cyEmu ? ref.cyEmu / EMU_PER_INCH * 96 : 600;
-          stats.vector++;
-        } else {
-          dataUrl = `data:${ctype};base64,${base64}`;
-          const dim = await measureImage(dataUrl);
-          nw = dim.naturalWidth; nh = dim.naturalHeight;
-        }
-
-        if (ref.type === 'float') stats.float++;
-        else if (ref.type === 'vml') stats.vml++;
-        else stats.inline++;
-
-        blocks.push({
-          type: 'image',
-          idx: imgIndex++,
-          src: dataUrl,
-          originalBase64: base64,    // 导出时优先使用原始字节
-          originalExt: ext,
-          naturalW: nw,
-          naturalH: nh,
-          contentType: ctype,
-          caption: captionText,
-          displayW: 0,
-          displayH: 0,
-          groupId: -1,
-          imageType: ref.type,        // inline / float / vml
-          // 仅第一张图带 caption；其余清空
-          ...((captionText && imgIndex > 1) ? { caption: '' } : {}),
-        });
-        captionText = ''; // 同段多图只把图注挂到第一张
       }
     }
 
@@ -232,18 +266,23 @@
     state.images = blocks.filter(b => b.type === 'image');
 
     const total = state.images.length;
-    log(`提取完成：${blocks.length} 段，图片 ${total} 张（嵌入式 ${stats.inline} · 浮动 ${stats.float} · VML ${stats.vml}）`, 'ok');
-    if (stats.float > 0) log(`已把 ${stats.float} 张浮动图片按嵌入式重新参与排版`, 'warn');
-    if (stats.vml > 0) log(`检测到 ${stats.vml} 张 VML 旧版图片，已正常解析`, 'warn');
-    if (stats.vector > 0) log(`${stats.vector} 张矢量图 (EMF/WMF) 浏览器无法预览，但导出会保留原始字节`, 'warn');
-    if (stats.skipped > 0) log(`${stats.skipped} 张图片关系/文件缺失，已跳过`, 'warn');
+    log(`提取完成：${blocks.length} 段，图片 ${total} 张（嵌入式 ${stats.inline} · 浮动 ${stats.float} · VML ${stats.vml}），唯一图片资源 ${imageCache.size} 个`, 'ok');
+    if (stats.float > 0) log(`已把 ${stats.float} 处浮动图片按嵌入式重新参与排版`, 'warn');
+    if (stats.vml > 0) log(`检测到 ${stats.vml} 处 VML 旧版图片，已正常解析`, 'warn');
+    if (stats.vector > 0) log(`${stats.vector} 处矢量图 (EMF/WMF) 浏览器无法预览，但导出会保留原始字节`, 'warn');
+    if (stats.skipped > 0) log(`${stats.skipped} 处图片关系/文件缺失，已跳过`, 'warn');
     if (total === 0) log('未在文档中找到任何图片', 'warn');
   }
 
   function parseXml(text) {
     const doc = new DOMParser().parseFromString(text, 'application/xml');
-    const err = doc.querySelector('parsererror');
-    if (err) throw new Error('XML 解析失败：' + err.textContent.slice(0, 120));
+    // 仅当 documentElement 本身是 parsererror（Chrome/Firefox 失败时的根）才报错；
+    // 不用 querySelector，避免误命中合法文档里恰好叫这个名字的元素。
+    const root = doc.documentElement;
+    if (!root) throw new Error('XML 无根元素');
+    if (root.localName === 'parsererror' || root.tagName === 'parsererror') {
+      throw new Error(root.textContent.slice(0, 200));
+    }
     return doc;
   }
 
@@ -1138,6 +1177,9 @@
       await runFullPipeline();
     } catch (e) {
       log('解析失败：' + e.message, 'error');
+      // 把第一行 stack 也打到日志，方便排查
+      const stackLine = (e.stack || '').split('\n').find(l => l.includes('app.js'));
+      if (stackLine) log('  位置：' + stackLine.trim(), 'error');
       console.error(e);
     }
   }
