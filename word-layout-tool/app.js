@@ -1056,20 +1056,29 @@
 </Relationships>`;
     zip.folder('word').folder('_rels').file('document.xml.rels', relsXml);
 
-    // 生成 document.xml
+    // 生成 document.xml —— 严格按预览的分页结果输出，每页之间插入显式分页符
+    // （否则 Word 自己会用不同字体度量重新分页，跟预览对不上）
     const body = [];
     let drawingDocId = 1;
-    state.blocks.forEach(b => {
-      if (b.type === 'text') {
-        body.push(makeTextParagraph(b.content, b.level));
-      } else {
-        const im = state.images[b.idx];
-        const widthEMU = Math.round(im.displayW / 72 * EMU_PER_INCH);
-        const heightEMU = Math.round(im.displayH / 72 * EMU_PER_INCH);
-        body.push(makeImageParagraph(im._rid, widthEMU, heightEMU, drawingDocId++, `Picture ${b.idx + 1}`));
-        if (im.caption) {
-          body.push(makeCaptionParagraph(im.caption, cfg.centerCaption, cfg.captionAfter));
+    const pages = state.pages.length > 0 ? state.pages : [{ blocks: state.blocks }];
+
+    pages.forEach((page, pageIdx) => {
+      page.blocks.forEach(b => {
+        if (b.type === 'text') {
+          body.push(makeTextParagraph(b.content, b.level, cfg.fontSize));
+        } else {
+          const im = state.images[b.idx];
+          const widthEMU = Math.round(im.displayW / 72 * EMU_PER_INCH);
+          const heightEMU = Math.round(im.displayH / 72 * EMU_PER_INCH);
+          body.push(makeImageParagraph(im._rid, widthEMU, heightEMU, drawingDocId++, `Picture ${b.idx + 1}`));
+          if (im.caption) {
+            body.push(makeCaptionParagraph(im.caption, cfg.centerCaption, cfg.captionAfter));
+          }
         }
+      });
+      // 页间插入分页符（最后一页除外）
+      if (pageIdx < pages.length - 1) {
+        body.push('<w:p><w:r><w:br w:type="page"/></w:r></w:p>');
       }
     });
 
@@ -1108,16 +1117,18 @@
     }[c]));
   }
 
-  function makeTextParagraph(text, level) {
+  function makeTextParagraph(text, level, baseFontPt) {
+    // w:sz 单位为 half-points，与预览的 1.8/1.4/1.2 倍同步
+    const half = (mul) => Math.round((baseFontPt || 10.5) * mul * 2);
     if (level === 0) {
-      // 一级标题：分页符 + 居中 + 加粗 + 大字号 + outlineLvl
-      return `<w:p><w:pPr><w:pageBreakBefore/><w:outlineLvl w:val="0"/><w:jc w:val="center"/><w:spacing w:before="240" w:after="240"/></w:pPr><w:r><w:rPr><w:b/><w:sz w:val="36"/></w:rPr><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`;
+      // 一级标题：居中 + 加粗 + outlineLvl（分页由外层循环负责，不用 pageBreakBefore）
+      return `<w:p><w:pPr><w:outlineLvl w:val="0"/><w:jc w:val="center"/><w:spacing w:before="240" w:after="240"/></w:pPr><w:r><w:rPr><w:b/><w:sz w:val="${half(1.8)}"/></w:rPr><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`;
     }
     if (level === 1) {
-      return `<w:p><w:pPr><w:outlineLvl w:val="1"/><w:spacing w:before="200" w:after="160"/></w:pPr><w:r><w:rPr><w:b/><w:sz w:val="28"/></w:rPr><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`;
+      return `<w:p><w:pPr><w:outlineLvl w:val="1"/><w:spacing w:before="200" w:after="160"/></w:pPr><w:r><w:rPr><w:b/><w:sz w:val="${half(1.4)}"/></w:rPr><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`;
     }
     if (level === 2) {
-      return `<w:p><w:pPr><w:outlineLvl w:val="2"/><w:spacing w:before="160" w:after="120"/></w:pPr><w:r><w:rPr><w:b/><w:sz w:val="24"/></w:rPr><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`;
+      return `<w:p><w:pPr><w:outlineLvl w:val="2"/><w:spacing w:before="160" w:after="120"/></w:pPr><w:r><w:rPr><w:b/><w:sz w:val="${half(1.2)}"/></w:rPr><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`;
     }
     return `<w:p><w:pPr><w:ind w:firstLineChars="200"/></w:pPr><w:r><w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`;
   }
