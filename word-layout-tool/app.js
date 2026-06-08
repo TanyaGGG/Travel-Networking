@@ -613,9 +613,10 @@
         cur.usedH += imageHeight(img);
 
         // 判断这是否为"本页末尾图片"（之后无内容或仅有图注/正文且足以填满）
-        // 简化：每张图入页后，向前看若下一个块加入会触发跨页，则当前图视为页末图
+        // 简化：每张图入页后，向前看若下一个块加入会触发跨页，则当前图视为页末图。
+        // 但若整个文档已无后续内容（!next），则当前是末页，留白多少都正常，不触发放大。
         const next = blocks[bi + 1];
-        const isLastOnPage = !next || (cur.usedH + (next.type === 'text' ? textHeight(next.content) : imageHeight(next)) > cfg.contentHpt);
+        const isLastOnPage = next && (cur.usedH + (next.type === 'text' ? textHeight(next.content) : imageHeight(next)) > cfg.contentHpt);
         if (isLastOnPage) {
           // 校验页尾留白
           const tail = tailWhitespace(cur);
@@ -794,10 +795,11 @@
         }
       });
 
-      // 页尾留白指示
+      // 页尾留白指示：末页不参与超限校验（全文已结束，留白多少都正常）
+      const isLastPage = pageIdx === state.pages.length - 1;
       const usedHpx = ptToPx(page.usedH);
       const tailPx = contentHpx - usedHpx;
-      if (tailPx > 4) {
+      if (tailPx > 4 && !isLastPage) {
         const indicator = document.createElement('div');
         indicator.className = 'tail-whitespace-indicator';
         if (tailPx > tailLimitPx) indicator.classList.add('warn');
