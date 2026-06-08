@@ -565,12 +565,17 @@
     function newPage() { return { blocks: [], usedH: 0 }; }
     function pushPage() { pages.push(cur); cur = newPage(); }
 
-    // 文本段落估算高度（按字数 / 行宽）
+    // 文本段落高度：用浏览器真实渲染来测量，避免中英文混排估算偏差
+    // （之前按"1 字 1 格"估算英文文献会高估 2~3 倍，导致整页内容被错挤到下一页）
+    const measureDiv = ensureMeasureDiv(cfg);
+    const heightCache = new Map();
     function textHeight(text) {
-      // 单行能容纳的中文字符数 ≈ 版心宽度(pt) / 字号(pt)（中文为方块字）
-      const charsPerLine = Math.floor(cfg.contentWpt / cfg.fontSize) - 2; // 减去缩进
-      const lines = Math.max(1, Math.ceil(text.length / Math.max(1, charsPerLine)));
-      return lines * lineHpt + 2; // 段后 2pt
+      if (heightCache.has(text)) return heightCache.get(text);
+      measureDiv.textContent = text;
+      // px → pt
+      const h = measureDiv.offsetHeight * (72 / 96) + 2;
+      heightCache.set(text, h);
+      return h;
     }
 
     function imageHeight(img) {
@@ -642,6 +647,33 @@
   }
 
   function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+  // 用一个屏幕外 div 测量真实文本高度（中英文混排准确）
+  let _measureDiv = null;
+  function ensureMeasureDiv(cfg) {
+    if (!_measureDiv) {
+      _measureDiv = document.createElement('div');
+      _measureDiv.style.cssText = `
+        position: absolute;
+        visibility: hidden;
+        left: -99999px;
+        top: 0;
+        word-wrap: break-word;
+        white-space: normal;
+        font-family: "Times New Roman", "SimSun", serif;
+        text-align: justify;
+        text-indent: 2em;
+        box-sizing: content-box;
+        margin: 0;
+        padding: 0;
+      `;
+      document.body.appendChild(_measureDiv);
+    }
+    _measureDiv.style.width = mmToPx(cfg.contentWmm) + 'px';
+    _measureDiv.style.fontSize = cfg.fontSize + 'pt';
+    _measureDiv.style.lineHeight = String(cfg.lineSpacing);
+    return _measureDiv;
+  }
 
   // 尝试通过放大本页末尾图片填补页尾留白
   function tryEnlargeImageForTail(img, page, cfg, blocks, bi) {
